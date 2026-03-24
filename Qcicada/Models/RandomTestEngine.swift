@@ -207,8 +207,15 @@ final class RandomTestEngine {
         isRunning = true
         
         // Background collection
+        let directionSnapshot = direction
+        let historySizeSnapshot = historySize
+        
         collectionThread = Thread {
-            self.collectionLoop(device: device)
+            self.collectionLoop(
+                device: device,
+                direction: directionSnapshot,
+                historySize: historySizeSnapshot
+            )
         }
         collectionThread?.qualityOfService = .userInitiated
         collectionThread?.name = "PKCollection"
@@ -230,7 +237,19 @@ final class RandomTestEngine {
     
     // MARK: - Collection Loop (runs on background thread)
     
-    private func collectionLoop(device: QCCDevice) {
+    private func collectionLoop(device: QCCDevice, direction: Int, historySize: Int) {
+        // Keep statistical state local to this background thread to avoid
+        // sharing mutable counters with the main thread.
+        var localSampleCount = 0
+        var localTotalBits = 0
+        var localTotalOnes = 0
+        var localMean = 0.0
+        var localM2 = 0.0
+        var localPeakInstHi = -999.0
+        var localPeakInstLo = 999.0
+        var localPeakCumHi = -999.0
+        var localPeakCumLo = 999.0
+        
         while isRunning && !(Thread.current.isCancelled) {
             guard let data = device.readContinuous(count: chunkSize) else {
                 continue
@@ -262,18 +281,29 @@ final class RandomTestEngine {
             let iz = Self.zScore(ones: ones, total: bits, direction: direction)
             
             // Cumulative
-            let newTotalOnes = totalOnes + ones
-            let newTotalBits = totalBits + bits
+            let newTotalOnes = localTotalOnes + ones
+            let newTotalBits = localTotalBits + bits
             let cz = Self.zScore(ones: newTotalOnes, total: newTotalBits, direction: direction)
             
-            let newSampleCount = sampleCount + 1
+            let newSampleCount = localSampleCount + 1
             
             // Welford online variance
-            let delta = iz - izMean
-            let newMean = izMean + delta / Double(newSampleCount)
+            let delta = iz - localMean
+            let newMean = localMean + delta / Double(newSampleCount)
             let delta2 = iz - newMean
-            let newM2 = welfordM2 + delta * delta2
+            let newM2 = localM2 + delta * delta2
             let newVar = newSampleCount > 1 ? newM2 / Double(newSampleCount) : 1.0
+            
+            // Update local thread-owned aggregates before publishing snapshot.
+            localSampleCount = newSampleCount
+            localTotalOnes = newTotalOnes
+            localTotalBits = newTotalBits
+            localMean = newMean
+            localM2 = newM2
+            if iz > localPeakInstHi { localPeakInstHi = iz }
+            if iz < localPeakInstLo { localPeakInstLo = iz }
+            if cz > localPeakCumHi { localPeakCumHi = cz }
+            if cz < localPeakCumLo { localPeakCumLo = cz }
             
             // Publish to main thread
             let finalIz = iz
@@ -284,7 +314,10 @@ final class RandomTestEngine {
             let finalOnes = newTotalOnes
             let finalBits = newTotalBits
             let finalM2 = newM2
-            let histSize = historySize
+            let finalPeakInstHi = localPeakInstHi
+            let finalPeakInstLo = localPeakInstLo
+            let finalPeakCumHi = localPeakCumHi
+            let finalPeakCumLo = localPeakCumLo
             
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -297,10 +330,10 @@ final class RandomTestEngine {
                 self.izVariance = finalVar
                 self.welfordM2 = finalM2
                 
-                if finalIz > self.peakInstHi { self.peakInstHi = finalIz }
-                if finalIz < self.peakInstLo { self.peakInstLo = finalIz }
-                if finalCz > self.peakCumHi { self.peakCumHi = finalCz }
-                if finalCz < self.peakCumLo { self.peakCumLo = finalCz }
+                self.peakInstHi = finalPeakInstHi
+                self.peakInstLo = finalPeakInstLo
+                self.peakCumHi = finalPeakCumHi
+                self.peakCumLo = finalPeakCumLo
                 
                 // Variance Z-score (chi-square approximation)
                 if finalN > 30 {
@@ -319,14 +352,14 @@ final class RandomTestEngine {
                 self.czHistory.append(finalCz)
                 self.varHistory.append(finalVar)
                 
-                if self.izHistory.count > histSize {
-                    self.izHistory.removeFirst(self.izHistory.count - histSize)
+                if self.izHistory.count > historySize {
+                    self.izHistory.removeFirst(self.izHistory.count - historySize)
                 }
-                if self.czHistory.count > histSize {
-                    self.czHistory.removeFirst(self.czHistory.count - histSize)
+                if self.czHistory.count > historySize {
+                    self.czHistory.removeFirst(self.czHistory.count - historySize)
                 }
-                if self.varHistory.count > histSize {
-                    self.varHistory.removeFirst(self.varHistory.count - histSize)
+                if self.varHistory.count > historySize {
+                    self.varHistory.removeFirst(self.varHistory.count - historySize)
                 }
             }
             

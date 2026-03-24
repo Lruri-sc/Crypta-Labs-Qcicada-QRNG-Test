@@ -13,6 +13,8 @@ struct ContentView: View {
     @State private var auditStatus = ""
     @State private var auditComplete = false
     @State private var lastAuditPath = ""
+    @State private var isClosingFlow = false
+    @State private var pendingWindowClose: (() -> Void)?
     
     var body: some View {
         ZStack {
@@ -76,6 +78,13 @@ struct ContentView: View {
             SettingsView(settings: settings)
                 .environment(\.locale, settings.localeForEnvironment)
         }
+        .background(
+            WindowCloseInterceptor { _ in
+                requestWindowClose {
+                    NSApplication.shared.terminate(nil)
+                }
+            }
+        )
     }
     
     // MARK: - Toolbar Background
@@ -166,14 +175,6 @@ struct ContentView: View {
             .buttonStyle(.borderless)
             .help(LocalizedStringResource("help.settings"))
             
-            Button {
-                requestExit()
-            } label: {
-                Image(systemName: "xmark.circle")
-                    .font(.system(size: 13))
-            }
-            .buttonStyle(.borderless)
-            .help(LocalizedStringResource("help.exit_app"))
         }
     }
     
@@ -297,26 +298,42 @@ struct ContentView: View {
                 auditComplete = true
                 showAuditProgress = false
                 completion?()
+                
+                // If the user clicked the red close button during audit, close now.
+                if let pendingClose = pendingWindowClose {
+                    pendingWindowClose = nil
+                    performCleanupAndClose(pendingClose)
+                }
             }
         }
     }
     
-    private func requestExit() {
-        guard !showAuditProgress else { return }
+    private func requestWindowClose(closeNow: @escaping () -> Void) {
+        if isClosingFlow { return }
+        
+        if showAuditProgress {
+            // Audit is already saving in background; close after it completes.
+            isClosingFlow = true
+            pendingWindowClose = closeNow
+            return
+        }
+        
+        isClosingFlow = true
         if engine.isRunning {
             stopAndAudit {
-                finishExit()
+                performCleanupAndClose(closeNow)
             }
         } else {
-            finishExit()
+            performCleanupAndClose(closeNow)
         }
     }
     
-    private func finishExit() {
+    private func performCleanupAndClose(_ closeNow: @escaping () -> Void) {
         engine.stop()
         engine.disconnect()
         engine.releaseMemory()
-        NSApplication.shared.terminate(nil)
+        isClosingFlow = false
+        closeNow()
     }
     
     // MARK: - Connect View
