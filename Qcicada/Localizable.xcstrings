@@ -22,13 +22,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "General RNG Tester"
+            "value" : "QRNG Test"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "普通测试随机数发生器软件"
+            "value" : "QRNG Test"
           }
         }
       }
