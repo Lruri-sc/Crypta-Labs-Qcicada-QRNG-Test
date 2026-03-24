@@ -123,6 +123,35 @@ final class RandomTestEngine {
         deviceSerial = "—"
     }
     
+    /// Drop large in-memory buffers and reset stats to minimize memory usage.
+    func releaseMemory() {
+        izHistory.removeAll(keepingCapacity: false)
+        czHistory.removeAll(keepingCapacity: false)
+        varHistory.removeAll(keepingCapacity: false)
+        izFull.removeAll(keepingCapacity: false)
+        czFull.removeAll(keepingCapacity: false)
+        varFull.removeAll(keepingCapacity: false)
+        
+        sampleCount = 0
+        totalBits = 0
+        totalOnes = 0
+        cumulativeZ = 0
+        instantZ = 0
+        peakInstHi = -999
+        peakInstLo = 999
+        peakCumHi = -999
+        peakCumLo = 999
+        izMean = 0
+        izVariance = 1.0
+        varianceZScore = 0
+        welfordM2 = 0
+        
+        currentRawFilePath = nil
+        currentCsvFilePath = nil
+        connectionError = nil
+        readyBytes = 0
+    }
+    
     // MARK: - Start / Stop Collection
     
     func start() {

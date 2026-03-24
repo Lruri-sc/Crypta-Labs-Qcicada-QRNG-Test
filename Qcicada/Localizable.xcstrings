@@ -614,6 +614,22 @@
         }
       }
     },
+    "help.exit_app" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exit app"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "退出应用"
+          }
+        }
+      }
+    },
     "language.chinese" : {
       "localizations" : {
         "en" : {

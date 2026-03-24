@@ -2,6 +2,7 @@
 // Qcicada
 
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @State private var engine = RandomTestEngine()
@@ -69,9 +70,11 @@ struct ContentView: View {
         .onDisappear {
             engine.stop()
             engine.disconnect()
+            engine.releaseMemory()
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: settings)
+                .environment(\.locale, settings.localeForEnvironment)
         }
     }
     
@@ -162,6 +165,15 @@ struct ContentView: View {
             }
             .buttonStyle(.borderless)
             .help(LocalizedStringResource("help.settings"))
+            
+            Button {
+                requestExit()
+            } label: {
+                Image(systemName: "xmark.circle")
+                    .font(.system(size: 13))
+            }
+            .buttonStyle(.borderless)
+            .help(LocalizedStringResource("help.exit_app"))
         }
     }
     
@@ -210,7 +222,7 @@ struct ContentView: View {
     
     // MARK: - Stop + Audit + Export
     
-    private func stopAndAudit() {
+    private func stopAndAudit(completion: (() -> Void)? = nil) {
         let izSnapshot = Array(engine.izFull)
         let czSnapshot = Array(engine.czFull)
         let varSnapshot = Array(engine.varFull)
@@ -236,6 +248,7 @@ struct ContentView: View {
         
         guard doPlot || doAudit else {
             auditComplete = true
+            completion?()
             return
         }
         
@@ -283,8 +296,27 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 auditComplete = true
                 showAuditProgress = false
+                completion?()
             }
         }
+    }
+    
+    private func requestExit() {
+        guard !showAuditProgress else { return }
+        if engine.isRunning {
+            stopAndAudit {
+                finishExit()
+            }
+        } else {
+            finishExit()
+        }
+    }
+    
+    private func finishExit() {
+        engine.stop()
+        engine.disconnect()
+        engine.releaseMemory()
+        NSApplication.shared.terminate(nil)
     }
     
     // MARK: - Connect View
