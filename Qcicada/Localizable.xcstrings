@@ -1192,6 +1192,22 @@
         }
       }
     },
+    "settings.language_footer" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Language changes apply immediately and will be remembered next time."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "语言切换会立即生效，并在下次启动时保持。"
+          }
+        }
+      }
+    },
     "settings.line_width" : {
       "localizations" : {
         "en" : {

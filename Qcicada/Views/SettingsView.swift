@@ -75,6 +75,8 @@ struct SettingsView: View {
                 }
             } header: {
                 Text(LocalizedStringResource("settings.language_section"))
+            } footer: {
+                Text(LocalizedStringResource("settings.language_footer"))
             }
             
             Section {

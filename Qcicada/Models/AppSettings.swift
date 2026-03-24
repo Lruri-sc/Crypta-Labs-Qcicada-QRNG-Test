@@ -7,6 +7,7 @@ import Observation
 
 @Observable
 final class AppSettings {
+    private static let languageKey = "settings.language"
     
     // MARK: - Active Theme
     var activePreset: ThemePreset = .default_ {
@@ -17,7 +18,11 @@ final class AppSettings {
     var colorSchemeOverride: ColorSchemeOption = .system
     
     // MARK: - Language
-    var language: Language = .system
+    var language: Language = .system {
+        didSet {
+            UserDefaults.standard.set(language.rawValue, forKey: Self.languageKey)
+        }
+    }
     
     // MARK: - Chart Colors (user-adjustable)
     var instantZColor: Color = .green
@@ -242,6 +247,10 @@ final class AppSettings {
     // MARK: - Init
     
     init() {
+        if let raw = UserDefaults.standard.string(forKey: Self.languageKey),
+           let saved = Language(rawValue: raw) {
+            language = saved
+        }
         applyPreset(.default_)
     }
 }
