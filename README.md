@@ -6,6 +6,8 @@ The original workflow was unpacked from their Python library and then reimplemen
 
 The app is focused on running QRNG test sessions and saving the session outputs locally.
 
+Currently, only the Apple Music theme is effective.
+
 After a test session, it generates:
 
 - raw bit stream file: `rng_raw_YYYYMMDD_HHMMSS.txt`
