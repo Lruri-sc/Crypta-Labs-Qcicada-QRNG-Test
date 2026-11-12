@@ -5,6 +5,7 @@ import SwiftUI
 
 @main
 struct QcicadaApp: App {
+    @NSApplicationDelegateAdaptor(QcicadaApplicationDelegate.self) private var appDelegate
     var body: some Scene {
         WindowGroup {
             ContentView()

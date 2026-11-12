@@ -8,6 +8,8 @@ import Observation
 @Observable
 final class AppSettings {
     private static let languageKey = "settings.language"
+    private static let exportPathKey = "settings.exportPath"
+    @ObservationIgnored private let defaults: UserDefaults
     
     // MARK: - Active Theme
     var activePreset: ThemePreset = .default_ {
@@ -20,7 +22,7 @@ final class AppSettings {
     // MARK: - Language
     var language: Language = .system {
         didSet {
-            UserDefaults.standard.set(language.rawValue, forKey: Self.languageKey)
+            defaults.set(language.rawValue, forKey: Self.languageKey)
         }
     }
     
@@ -32,7 +34,9 @@ final class AppSettings {
     var chartLineWidth: Double = 1.2
     
     // MARK: - Export
-    var exportPath: String = NSHomeDirectory() + "/Documents"
+    var exportPath: String = NSHomeDirectory() + "/Documents" {
+        didSet { defaults.set(exportPath, forKey: Self.exportPathKey) }
+    }
     var autoSavePlot: Bool = true
     var autoSaveAudit: Bool = true
     
@@ -246,8 +250,12 @@ final class AppSettings {
     
     // MARK: - Init
     
-    init() {
-        if let raw = UserDefaults.standard.string(forKey: Self.languageKey),
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let savedPath = defaults.string(forKey: Self.exportPathKey), !savedPath.isEmpty {
+            exportPath = savedPath
+        }
+        if let raw = defaults.string(forKey: Self.languageKey),
            let saved = Language(rawValue: raw) {
             language = saved
         }

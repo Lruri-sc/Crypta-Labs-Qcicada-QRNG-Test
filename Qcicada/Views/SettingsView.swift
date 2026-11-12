@@ -6,42 +6,30 @@ import AppKit
 
 struct SettingsView: View {
     @Bindable var settings: AppSettings
-    @Environment(\.dismiss) private var dismiss
-    
+    let pane: SettingsPane
+    let width: CGFloat
+    /// The height the window gives this pane. `nil` lays the pane out at its natural
+    /// height, which is how the window controller measures it.
+    let height: CGFloat?
+    let chooseFolder: () -> Void
+    let windowConfigurationChanged: () -> Void
+
     var body: some View {
-        VStack(spacing: 0) {
-            // Window title bar area
-            HStack {
-                Text(LocalizedStringResource("settings.title"))
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-            
-            Divider()
-            
-            TabView {
-                appearanceTab
-                    .tabItem {
-                        Label(LocalizedStringResource("settings.appearance"), systemImage: "paintbrush")
-                    }
-                
-                chartsTab
-                    .tabItem {
-                        Label(LocalizedStringResource("settings.charts"), systemImage: "chart.xyaxis.line")
-                    }
-                
-                exportTab
-                    .tabItem {
-                        Label(LocalizedStringResource("settings.export"), systemImage: "square.and.arrow.up")
-                    }
+        Group {
+            switch pane {
+            case .appearance: appearanceTab
+            case .charts: chartsTab
+            case .export: exportTab
             }
         }
-        .frame(width: 500, height: 480)
+        .environment(\.locale, settings.localeForEnvironment)
+        .preferredColorScheme(settings.resolvedColorScheme)
+        .fixedSize(horizontal: false, vertical: height == nil)
+        .frame(width: width, height: height)
+        .onChange(of: settings.language) { _, _ in windowConfigurationChanged() }
+        .onChange(of: settings.colorSchemeOverride) { _, _ in windowConfigurationChanged() }
     }
-    
+
     // MARK: - 外观
     
     private var appearanceTab: some View {
@@ -143,55 +131,46 @@ struct SettingsView: View {
     private var exportTab: some View {
         Form {
             Section {
-                HStack(spacing: 8) {
-                    Image(systemName: "folder")
-                        .foregroundStyle(.secondary)
-                        .font(.system(size: 13))
-                    Text(settings.exportPath)
-                        .font(.system(size: 12, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .foregroundStyle(.secondary)
-                    
-                    Spacer()
-                    
-                    Button {
-                        chooseExportPath()
-                    } label: {
+                HStack {
+                    SettingsPathControl(path: settings.exportPath)
+                    Button(action: chooseFolder) {
                         Text(LocalizedStringResource("export.choose_ellipsis"))
                     }
-                    .controlSize(.small)
                 }
             } header: {
-                Text(LocalizedStringResource("export.folder"))
+                Text(LocalizedStringResource("export.save_location"))
+            } footer: {
+                Text(LocalizedStringResource("export.save_location_footer"))
             }
-            
+
             Section {
                 Toggle(isOn: $settings.autoSavePlot) {
-                    Text(LocalizedStringResource("export.auto_plot"))
+                    Text(LocalizedStringResource("export.waveform"))
                 }
                 Toggle(isOn: $settings.autoSaveAudit) {
-                    Text(LocalizedStringResource("export.auto_audit"))
+                    Text(LocalizedStringResource("export.audit_report"))
                 }
             } header: {
-                Text(LocalizedStringResource("export.auto_on_stop"))
+                Text(LocalizedStringResource("export.save_when_stopping"))
             }
         }
         .formStyle(.grouped)
     }
-    
-    private func chooseExportPath() {
-        let loc = settings.stringResolutionLocale
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = String(localized: "export.choose_folder_title", locale: loc ?? .current)
-        panel.prompt = String(localized: "export.choose_folder_prompt", locale: loc ?? .current)
-        
-        if panel.runModal() == .OK, let url = panel.url {
-            settings.exportPath = url.path
-        }
+}
+
+private struct SettingsPathControl: NSViewRepresentable {
+    let path: String
+
+    func makeNSView(context: Context) -> NSPathControl {
+        let view = NSPathControl()
+        view.pathStyle = .standard
+        view.isEditable = false
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateNSView(_ view: NSPathControl, context: Context) {
+        view.url = URL(fileURLWithPath: path, isDirectory: true)
     }
 }
 

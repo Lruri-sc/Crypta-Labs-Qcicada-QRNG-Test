@@ -7,6 +7,34 @@
 import Foundation
 import Observation
 
+/// A sealed session. Values and file locations cannot change when another session starts.
+nonisolated struct CompletedSessionSnapshot: Sendable, Identifiable {
+    let id: UUID
+    let fileID: String?
+    let directory: String
+    let port: String
+    let direction: Int
+    let chunkSize: Int
+    let rawFilePath: String?
+    let csvFilePath: String?
+    let sampleCount: Int
+    let totalBits: Int
+    let totalOnes: Int
+    let cumulativeZ: Double
+    let instantZ: Double
+    let izMean: Double
+    let izVariance: Double
+    let peakInstHi: Double
+    let peakInstLo: Double
+    let peakCumHi: Double
+    let peakCumLo: Double
+    let iz: [Double]
+    let cz: [Double]
+    let variance: [Double]
+    let failure: String?
+}
+
+@MainActor
 @Observable
 final class RandomTestEngine {
     
@@ -54,354 +82,324 @@ final class RandomTestEngine {
     // MARK: - File Paths (public for audit/export)
     var currentRawFilePath: String?
     var currentCsvFilePath: String?
+    private(set) var sessionID: String?
+    private(set) var sessionDirectory: String?
+    private(set) var sessionPort: String = ""
+    private(set) var sessionDirection = 1
+    private(set) var sessionChunkSize = 8192
+    private(set) var isBusy = false
+    private(set) var completedSession: CompletedSessionSnapshot?
+    @ObservationIgnored var onSessionFinished: (@MainActor (CompletedSessionSnapshot) -> Void)?
     var exportDirectory: String = NSHomeDirectory() + "/Documents"
     
-    // MARK: - Internals
-    private var device: QCCDevice?
-    private var serial: SerialPort?
-    private var collectionThread: Thread?
-    private var welfordM2: Double = 0
-    private var rawFileHandle: FileHandle?
-    private var csvFileHandle: FileHandle?
-    
-    // MARK: - Connect
-    
+    // The queue owns all serial I/O. The main actor owns all observable state.
+    @ObservationIgnored private let ioQueue = DispatchQueue(label: "Qcicada.acquisition", qos: .userInitiated)
+    @ObservationIgnored private var device: QCCDevice?
+    @ObservationIgnored private let makeDevice: @Sendable (String) throws -> QCCDevice
+
+    init(makeDevice: @escaping @Sendable (String) throws -> QCCDevice = { path in
+        let serial = SerialPort(path: path)
+        try serial.open()
+        return QCCDevice(serial: serial)
+    }) {
+        self.makeDevice = makeDevice
+    }
+    @ObservationIgnored private var activeSession: AcquisitionSession?
+    @ObservationIgnored private var stopCompletions: [() -> Void] = []
+
     func connect() {
+        guard !isBusy, !isConnected, !isRunning else { return }
         connectionError = nil
-        
         guard !portPath.isEmpty else {
             connectionError = String(localized: "error.no_port", locale: Self.uiLocale ?? .current)
             return
         }
-        
-        let sp = SerialPort(path: portPath)
-        
-        // Try to connect with cleanup
-        do {
-            try sp.open()
-        } catch {
-            connectionError = error.localizedDescription
-            return
-        }
-        
-        let dev = QCCDevice(serial: sp)
-        
-        // Try stop (cleanup from previous session)
-        _ = dev.stop()
-        Thread.sleep(forTimeInterval: 0.3)
-        dev.flushBuffers()
-        Thread.sleep(forTimeInterval: 0.2)
-        
-        // Verify device
-        if let status = dev.getStatus() {
-            readyBytes = status.readyBytes
-            isConnected = true
-            
-            // Try to get device info (may fail on some FW)
-            if let info = dev.getInfo() {
-                deviceSerial = info.serial
-            } else {
-                deviceSerial = "connected"
+        isBusy = true
+        let path = portPath
+        let locale = Self.uiLocale
+        let makeDevice = makeDevice
+        ioQueue.async { [weak self] in
+            var openedDevice: QCCDevice?
+            do {
+                let device = try makeDevice(path)
+                openedDevice = device
+                _ = device.stop()
+                Thread.sleep(forTimeInterval: 0.3)
+                device.flushBuffers()
+                Thread.sleep(forTimeInterval: 0.2)
+                guard let status = device.getStatus() else {
+                    throw AcquisitionError.message(String(localized: "error.device_not_responding", locale: locale ?? .current))
+                }
+                let serialNumber = device.getInfo()?.serial ?? "connected"
+                device.flushBuffers()
+                DispatchQueue.main.async {
+                    guard let self else { device.closeComm(); return }
+                    self.device = device
+                    self.sessionPort = path
+                    self.deviceSerial = serialNumber
+                    self.readyBytes = status.readyBytes
+                    self.isConnected = true
+                    self.isBusy = false
+                }
+            } catch {
+                openedDevice?.closeComm()
+                let message = error.localizedDescription
+                DispatchQueue.main.async {
+                    self?.isBusy = false
+                    self?.connectionError = message
+                }
             }
-        } else {
-            connectionError = String(localized: "error.device_not_responding", locale: Self.uiLocale ?? .current)
-            sp.close()
+        }
+    }
+
+    func disconnect(completion: (() -> Void)? = nil) {
+        // A connection attempt is allowed to finish before its queued close.
+        if isBusy && !isRunning {
+            ioQueue.async { [weak self] in
+                DispatchQueue.main.async { self?.disconnect(completion: completion) }
+            }
             return
         }
-        
-        dev.flushBuffers()
-        self.serial = sp
-        self.device = dev
+        stop { [weak self] in
+            guard let self else { completion?(); return }
+            let device = self.device
+            self.device = nil
+            self.isConnected = false
+            self.deviceSerial = "—"
+            self.readyBytes = 0
+            self.isBusy = true
+            self.ioQueue.async {
+                device?.closeComm()
+                DispatchQueue.main.async {
+                    self.isBusy = false
+                    completion?()
+                }
+            }
+        }
     }
-    
-    func disconnect() {
-        stop()
-        device?.closeComm()
-        serial = nil
-        device = nil
-        isConnected = false
-        deviceSerial = "—"
-    }
-    
-    /// Drop large in-memory buffers and reset stats to minimize memory usage.
+
+    /// Drop buffers only after collection has finished publishing its last sample.
     func releaseMemory() {
-        izHistory.removeAll(keepingCapacity: false)
-        czHistory.removeAll(keepingCapacity: false)
-        varHistory.removeAll(keepingCapacity: false)
-        izFull.removeAll(keepingCapacity: false)
-        czFull.removeAll(keepingCapacity: false)
-        varFull.removeAll(keepingCapacity: false)
-        
-        sampleCount = 0
-        totalBits = 0
-        totalOnes = 0
-        cumulativeZ = 0
-        instantZ = 0
-        peakInstHi = -999
-        peakInstLo = 999
-        peakCumHi = -999
-        peakCumLo = 999
-        izMean = 0
-        izVariance = 1.0
-        varianceZScore = 0
-        welfordM2 = 0
-        
+        guard !isRunning, !isBusy else { return }
+        resetStatistics()
         currentRawFilePath = nil
         currentCsvFilePath = nil
+        sessionID = nil
+        sessionDirectory = nil
+        completedSession = nil
         connectionError = nil
         readyBytes = 0
     }
-    
-    // MARK: - Start / Stop Collection
-    
+
+    private func resetStatistics() {
+        izHistory = []; czHistory = []; varHistory = []
+        izFull = []; czFull = []; varFull = []
+        sampleCount = 0; totalBits = 0; totalOnes = 0
+        cumulativeZ = 0; instantZ = 0
+        peakInstHi = -999; peakInstLo = 999
+        peakCumHi = -999; peakCumLo = 999
+        izMean = 0; izVariance = 1; varianceZScore = 0
+    }
+
     func start() {
-        guard let device = device, isConnected else { return }
-        
-        // Reset stats
-        sampleCount = 0
-        totalBits = 0
-        totalOnes = 0
-        cumulativeZ = 0
-        instantZ = 0
-        peakInstHi = -999
-        peakInstLo = 999
-        peakCumHi = -999
-        peakCumLo = 999
-        izMean = 0
-        izVariance = 1.0
-        varianceZScore = 0
-        welfordM2 = 0
-        izHistory = []
-        czHistory = []
-        varHistory = []
-        izFull = []
-        czFull = []
-        varFull = []
-        
-        let ts = Self.timestamp()
-        
-        // Setup raw file
-        if saveRaw {
-            let rawPath = (exportDirectory as NSString).appendingPathComponent("rng_raw_\(ts).txt")
-            FileManager.default.createFile(atPath: rawPath, contents: nil)
-            rawFileHandle = FileHandle(forWritingAtPath: rawPath)
-            currentRawFilePath = rawPath
-        }
-        
-        // Setup stats CSV
-        let csvPath = (exportDirectory as NSString).appendingPathComponent("rng_stats_\(ts).csv")
-        let csvHeader = "n,iz,cz,var,ones,bits,cum_ones,cum_bits\n"
-        FileManager.default.createFile(atPath: csvPath, contents: csvHeader.data(using: .utf8))
-        csvFileHandle = FileHandle(forWritingAtPath: csvPath)
-        csvFileHandle?.seekToEndOfFile()
-        currentCsvFilePath = csvPath
-        
-        device.flushBuffers()
-        Thread.sleep(forTimeInterval: 0.2)
-        
-        guard device.startContinuous() else {
-            connectionError = String(localized: "error.start_continuous_failed", locale: Self.uiLocale ?? .current)
-            return
-        }
-        
+        guard let device, isConnected, !isBusy, !isRunning else { return }
+        guard chunkSize > 0, historySize > 0 else { return }
+        resetStatistics()
+        connectionError = nil
+        currentRawFilePath = nil
+        currentCsvFilePath = nil
+        sessionID = nil
+        completedSession = nil
+        sessionDirectory = exportDirectory
+        sessionDirection = direction
+        sessionChunkSize = chunkSize
+        let session = AcquisitionSession()
+        activeSession = session
         isRunning = true
-        
-        // Background collection
-        let directionSnapshot = direction
-        let historySizeSnapshot = historySize
-        
-        collectionThread = Thread {
-            self.collectionLoop(
-                device: device,
-                direction: directionSnapshot,
-                historySize: historySizeSnapshot
-            )
-        }
-        collectionThread?.qualityOfService = .userInitiated
-        collectionThread?.name = "PKCollection"
-        collectionThread?.start()
-    }
-    
-    func stop() {
-        isRunning = false
-        collectionThread?.cancel()
-        collectionThread = nil
-        
-        _ = device?.stop()
-        
-        rawFileHandle?.closeFile()
-        rawFileHandle = nil
-        csvFileHandle?.closeFile()
-        csvFileHandle = nil
-    }
-    
-    // MARK: - Collection Loop (runs on background thread)
-    
-    private func collectionLoop(device: QCCDevice, direction: Int, historySize: Int) {
-        // Keep statistical state local to this background thread to avoid
-        // sharing mutable counters with the main thread.
-        var localSampleCount = 0
-        var localTotalBits = 0
-        var localTotalOnes = 0
-        var localMean = 0.0
-        var localM2 = 0.0
-        var localPeakInstHi = -999.0
-        var localPeakInstLo = 999.0
-        var localPeakCumHi = -999.0
-        var localPeakCumLo = 999.0
-        
-        while isRunning && !(Thread.current.isCancelled) {
-            guard let data = device.readContinuous(count: chunkSize) else {
-                continue
+        let directory = exportDirectory
+        let chunk = chunkSize
+        let direction = direction
+        let historyLimit = historySize
+        let saveRaw = saveRaw
+        let locale = Self.uiLocale
+        ioQueue.async { [weak self] in
+            var failure: String?
+            var connectionLost = false
+            do {
+                try Self.collect(device: device, session: session, directory: directory,
+                                 chunkSize: chunk, direction: direction, saveRaw: saveRaw, locale: locale,
+                                 prepared: { id, rawPath, csvPath in
+                    DispatchQueue.main.async {
+                        guard let self, self.activeSession === session else { return }
+                        self.sessionID = id
+                        self.currentRawFilePath = rawPath
+                        self.currentCsvFilePath = csvPath
+                    }
+                }, publish: { sample in
+                    DispatchQueue.main.async {
+                        guard let self, self.activeSession === session else { return }
+                        self.publish(sample, historyLimit: historyLimit)
+                    }
+                })
+            } catch {
+                failure = error.localizedDescription
+                connectionLost = error is SerialError || (error as? CollectionFailure)?.connectionLost == true
+                if connectionLost { device.closeComm() }
             }
-            
-            // Write raw 01 string to file
-            if let fh = rawFileHandle {
-                // Convert bytes to bit string efficiently
-                var bitString = ""
-                bitString.reserveCapacity(data.count * 8)
-                for byte in data {
-                    for i in (0..<8).reversed() {
-                        bitString.append((byte >> i) & 1 == 1 ? "1" : "0")
+            let finalError = failure
+            let disconnected = connectionLost
+            // FIFO delivery puts all accepted samples before completion/audit.
+            DispatchQueue.main.async {
+                guard let self, self.activeSession === session else { return }
+                self.activeSession = nil
+                self.isRunning = false
+                if disconnected {
+                    self.device = nil
+                    self.isConnected = false
+                    self.deviceSerial = "—"
+                    self.readyBytes = 0
+                }
+                if let finalError { self.connectionError = finalError }
+                let snapshot = CompletedSessionSnapshot(
+                    id: session.id, fileID: self.sessionID,
+                    directory: directory, port: self.sessionPort,
+                    direction: direction, chunkSize: chunk,
+                    rawFilePath: self.currentRawFilePath, csvFilePath: self.currentCsvFilePath,
+                    sampleCount: self.sampleCount, totalBits: self.totalBits, totalOnes: self.totalOnes,
+                    cumulativeZ: self.cumulativeZ, instantZ: self.instantZ,
+                    izMean: self.izMean, izVariance: self.izVariance,
+                    peakInstHi: self.peakInstHi, peakInstLo: self.peakInstLo,
+                    peakCumHi: self.peakCumHi, peakCumLo: self.peakCumLo,
+                    iz: self.izFull, cz: self.czFull, variance: self.varFull,
+                    failure: finalError
+                )
+                self.completedSession = snapshot
+                let completions = self.stopCompletions
+                self.stopCompletions.removeAll()
+                self.onSessionFinished?(snapshot)
+                completions.forEach { $0() }
+            }
+        }
+    }
+
+    func stop(completion: (() -> Void)? = nil) {
+        guard let session = activeSession else { completion?(); return }
+        if let completion { stopCompletions.append(completion) }
+        session.cancel()
+    }
+
+    private func publish(_ sample: AcquisitionSample, historyLimit: Int) {
+        sampleCount = sample.n; totalBits = sample.bits; totalOnes = sample.ones
+        instantZ = sample.iz; cumulativeZ = sample.cz
+        izMean = sample.mean; izVariance = sample.variance
+        peakInstHi = max(peakInstHi, sample.iz); peakInstLo = min(peakInstLo, sample.iz)
+        peakCumHi = max(peakCumHi, sample.cz); peakCumLo = min(peakCumLo, sample.cz)
+        if sample.n > 30 {
+            // The displayed variance uses M2/n; chi-square therefore uses n*variance.
+            varianceZScore = sqrt(2 * Double(sample.n) * sample.variance) - sqrt(2 * Double(sample.n - 1) - 1)
+        }
+        izFull.append(sample.iz); czFull.append(sample.cz); varFull.append(sample.variance)
+        izHistory.append(sample.iz); czHistory.append(sample.cz); varHistory.append(sample.variance)
+        if izHistory.count > historyLimit { izHistory.removeFirst(izHistory.count - historyLimit) }
+        if czHistory.count > historyLimit { czHistory.removeFirst(czHistory.count - historyLimit) }
+        if varHistory.count > historyLimit { varHistory.removeFirst(varHistory.count - historyLimit) }
+    }
+
+    nonisolated private static func collect(
+        device: QCCDevice, session: AcquisitionSession, directory: String,
+        chunkSize: Int, direction: Int, saveRaw: Bool, locale: Locale?,
+        prepared: (String, String?, String) -> Void,
+        publish: (AcquisitionSample) -> Void
+    ) throws {
+        let output = try SessionOutput(directory: directory, saveRaw: saveRaw)
+        defer { output.close() }
+        prepared(output.id, output.rawPath, output.csvPath)
+        var failures: [String] = []
+        var connectionLost = false
+        var shouldStopDevice = false
+        do {
+            if !session.isCancelled {
+                device.flushBuffers()
+                Thread.sleep(forTimeInterval: 0.2)
+                if !session.isCancelled {
+                    // A failed START reply can still mean that the device started streaming.
+                    shouldStopDevice = true
+                    guard device.startContinuous() else {
+                        if let error = device.lastTransportError { throw error }
+                        throw AcquisitionError.message(String(localized: "error.start_continuous_failed", locale: locale ?? .current))
+                    }
+                    var n = 0, totalBits = 0, totalOnes = 0
+                    var mean = 0.0, m2 = 0.0
+                    while !session.isCancelled {
+                        guard let data = device.readContinuous(count: chunkSize) else {
+                            if let error = device.lastTransportError { throw error }
+                            continue
+                        }
+                        let ones = data.reduce(0) { $0 + $1.nonzeroBitCount }
+                        let bits = data.count * 8
+                        n += 1; totalBits += bits; totalOnes += ones
+                        let iz = zScore(ones: ones, total: bits, direction: direction)
+                        let cz = zScore(ones: totalOnes, total: totalBits, direction: direction)
+                        let delta = iz - mean
+                        mean += delta / Double(n)
+                        m2 += delta * (iz - mean)
+                        let variance = n > 1 ? m2 / Double(n) : 1.0
+                        // Publish only after both writes succeed; all I/O stays on this queue.
+                        try output.write(data: data, n: n, iz: iz, cz: cz, variance: variance,
+                                         ones: ones, bits: bits, totalOnes: totalOnes, totalBits: totalBits)
+                        publish(AcquisitionSample(n: n, bits: totalBits, ones: totalOnes,
+                                                  iz: iz, cz: cz, mean: mean, variance: variance))
                     }
                 }
-                if let strData = bitString.data(using: .ascii) {
-                    fh.write(strData)
-                }
             }
-            
-            // Count ones
-            var ones = 0
-            for byte in data {
-                ones += Self.popcount(byte)
-            }
-            let bits = data.count * 8
-            
-            // Instant Z
-            let iz = Self.zScore(ones: ones, total: bits, direction: direction)
-            
-            // Cumulative
-            let newTotalOnes = localTotalOnes + ones
-            let newTotalBits = localTotalBits + bits
-            let cz = Self.zScore(ones: newTotalOnes, total: newTotalBits, direction: direction)
-            
-            let newSampleCount = localSampleCount + 1
-            
-            // Welford online variance
-            let delta = iz - localMean
-            let newMean = localMean + delta / Double(newSampleCount)
-            let delta2 = iz - newMean
-            let newM2 = localM2 + delta * delta2
-            let newVar = newSampleCount > 1 ? newM2 / Double(newSampleCount) : 1.0
-            
-            // Update local thread-owned aggregates before publishing snapshot.
-            localSampleCount = newSampleCount
-            localTotalOnes = newTotalOnes
-            localTotalBits = newTotalBits
-            localMean = newMean
-            localM2 = newM2
-            if iz > localPeakInstHi { localPeakInstHi = iz }
-            if iz < localPeakInstLo { localPeakInstLo = iz }
-            if cz > localPeakCumHi { localPeakCumHi = cz }
-            if cz < localPeakCumLo { localPeakCumLo = cz }
-            
-            // Publish to main thread
-            let finalIz = iz
-            let finalCz = cz
-            let finalVar = newVar
-            let finalMean = newMean
-            let finalN = newSampleCount
-            let finalOnes = newTotalOnes
-            let finalBits = newTotalBits
-            let finalM2 = newM2
-            let finalPeakInstHi = localPeakInstHi
-            let finalPeakInstLo = localPeakInstLo
-            let finalPeakCumHi = localPeakCumHi
-            let finalPeakCumLo = localPeakCumLo
-            
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.sampleCount = finalN
-                self.totalOnes = finalOnes
-                self.totalBits = finalBits
-                self.instantZ = finalIz
-                self.cumulativeZ = finalCz
-                self.izMean = finalMean
-                self.izVariance = finalVar
-                self.welfordM2 = finalM2
-                
-                self.peakInstHi = finalPeakInstHi
-                self.peakInstLo = finalPeakInstLo
-                self.peakCumHi = finalPeakCumHi
-                self.peakCumLo = finalPeakCumLo
-                
-                // Variance Z-score (chi-square approximation)
-                if finalN > 30 {
-                    let chi2 = Double(finalN - 1) * finalVar
-                    let df = Double(finalN - 1)
-                    self.varianceZScore = sqrt(2.0 * chi2) - sqrt(2.0 * df - 1.0)
-                }
-                
-                // Full history (for export)
-                self.izFull.append(finalIz)
-                self.czFull.append(finalCz)
-                self.varFull.append(finalVar)
-                
-                // Sliding window history (for chart)
-                self.izHistory.append(finalIz)
-                self.czHistory.append(finalCz)
-                self.varHistory.append(finalVar)
-                
-                if self.izHistory.count > historySize {
-                    self.izHistory.removeFirst(self.izHistory.count - historySize)
-                }
-                if self.czHistory.count > historySize {
-                    self.czHistory.removeFirst(self.czHistory.count - historySize)
-                }
-                if self.varHistory.count > historySize {
-                    self.varHistory.removeFirst(self.varHistory.count - historySize)
-                }
-            }
-            
-            // Write CSV (on background thread, non-blocking)
-            if let fh = csvFileHandle {
-                let line = "\(newSampleCount),\(String(format: "%.6f", iz)),\(String(format: "%.6f", cz)),\(String(format: "%.6f", newVar)),\(ones),\(bits),\(newTotalOnes),\(newTotalBits)\n"
-                if let data = line.data(using: .utf8) {
-                    fh.write(data)
-                }
-            }
+        } catch {
+            failures.append(error.localizedDescription)
+            connectionLost = error is SerialError
+        }
+
+        // Seal every file even after a transport/write error. The final callback must never
+        // race an open output handle or omit a synchronization/close failure.
+        if shouldStopDevice && !device.stop() {
+            let failure = device.lastTransportError?.localizedDescription
+                ?? "The device did not acknowledge the stop command."
+            if !failures.contains(failure) { failures.append(failure) }
+            connectionLost = true
+        }
+        do {
+            try output.finish()
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        if !failures.isEmpty {
+            throw CollectionFailure(messages: failures, connectionLost: connectionLost)
         }
     }
-    
+
     // MARK: - Helpers
     
-    static func zScore(ones: Int, total: Int, direction: Int) -> Double {
+    nonisolated static func zScore(ones: Int, total: Int, direction: Int) -> Double {
         guard total >= 8 else { return 0 }
         let z = (Double(ones) - Double(total) * 0.5) / sqrt(Double(total) * 0.25)
         return direction == 1 ? z : -z
     }
     
-    static func popcount(_ byte: UInt8) -> Int {
-        var n = byte
-        var count = 0
-        while n != 0 {
-            count += Int(n & 1)
-            n >>= 1
-        }
-        return count
+    nonisolated static func popcount(_ byte: UInt8) -> Int {
+        byte.nonzeroBitCount
     }
     
-    static func timestamp() -> String {
+    nonisolated static func timestamp() -> String {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
         f.dateFormat = "yyyyMMdd_HHmmss"
         return f.string(from: Date())
     }
     
-    static func pValue(_ z: Double) -> Double {
+    nonisolated static func pValue(_ z: Double) -> Double {
         return 0.5 * erfc(z / sqrt(2.0))
     }
     
-    static func interpret(_ z: Double) -> String {
+    nonisolated static func interpret(_ z: Double) -> String {
         let az = abs(z)
         if az >= 3.29 { return "EXTREME" }
         if az >= 2.58 { return "VERY SIG" }
@@ -413,7 +411,163 @@ final class RandomTestEngine {
     
     // MARK: - Available Ports
     
-    static func availablePorts() -> [String] {
+    nonisolated static func availablePorts() -> [String] {
         SerialPort.availablePorts()
+    }
+}
+
+
+nonisolated private struct AcquisitionSample: Sendable {
+    let n: Int, bits: Int, ones: Int
+    let iz: Double, cz: Double, mean: Double, variance: Double
+}
+
+nonisolated private final class AcquisitionSession: @unchecked Sendable {
+    let id = UUID()
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool { lock.withLock { cancelled } }
+    func cancel() { lock.withLock { cancelled = true } }
+}
+
+nonisolated private struct CollectionFailure: LocalizedError {
+    let messages: [String]
+    let connectionLost: Bool
+    var errorDescription: String? { messages.joined(separator: "\n") }
+}
+
+nonisolated private enum AcquisitionError: LocalizedError {
+    case message(String)
+    var errorDescription: String? {
+        switch self { case .message(let message): return message }
+    }
+}
+
+/// Owns file handles for one collection. Created, written, and closed on the I/O queue.
+nonisolated final class SessionOutput {
+    let id: String
+    let rawPath: String?
+    let csvPath: String
+    private var raw: FileHandle?
+    private var csv: FileHandle?
+    private static let bitText: [UInt8] = (0...255).flatMap { value in
+        (0..<8).reversed().map { bit in ((value >> bit) & 1) == 1 ? 0x31 : 0x30 }
+    }
+
+    init(directory: String, saveRaw: Bool) throws {
+        let folder = URL(fileURLWithPath: directory, isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw CocoaError(.fileWriteInvalidFileName, userInfo: [NSFilePathErrorKey: directory])
+        }
+        let reserved = try Self.reserveFiles(in: folder, saveRaw: saveRaw)
+        id = reserved.id
+        rawPath = reserved.rawPath
+        csvPath = reserved.csvPath
+        raw = reserved.raw
+        csv = reserved.csv
+        do {
+            try csv?.write(contentsOf: Data("n,iz,cz,var,ones,bits,cum_ones,cum_bits\n".utf8))
+        } catch {
+            close()
+            throw error
+        }
+    }
+
+    private static func reserveFiles(in folder: URL, saveRaw: Bool) throws
+        -> (id: String, rawPath: String?, csvPath: String, raw: FileHandle?, csv: FileHandle) {
+        let base = RandomTestEngine.timestamp()
+        var candidate = base
+        while true {
+            let urls = ["raw", "stats", "audit", "session"].map { name in
+                folder.appendingPathComponent("rng_\(name)_\(candidate).\(name == "stats" ? "csv" : name == "session" ? "png" : "txt")")
+            }
+            if urls.contains(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+                candidate = base + "_" + UUID().uuidString
+                continue
+            }
+            do {
+                let csvHandle = try createFile(at: urls[1])
+                do {
+                    let rawHandle = saveRaw ? try createFile(at: urls[0]) : nil
+                    return (candidate, saveRaw ? urls[0].path : nil, urls[1].path, rawHandle, csvHandle)
+                } catch {
+                    try? csvHandle.close()
+                    throw error
+                }
+            } catch let error as POSIXError where error.code == .EEXIST {
+                candidate = base + "_" + UUID().uuidString
+            }
+        }
+    }
+
+    private static func createFile(at url: URL) throws -> FileHandle {
+        let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
+    static func rawText(_ data: Data) -> Data {
+        var result = Data(count: data.count * 8)
+        // Fill one allocation instead of appending to Data once for every input byte.
+        // Unsafe buffer indices start at zero even when data is a nonzero-index slice.
+        result.withUnsafeMutableBytes { output in
+            data.withUnsafeBytes { (input: UnsafeRawBufferPointer) in
+                bitText.withUnsafeBytes { lookup in
+                    for index in input.indices {
+                        output.baseAddress!.advanced(by: index * 8).copyMemory(
+                            from: lookup.baseAddress!.advanced(by: Int(input[index]) * 8),
+                            byteCount: 8
+                        )
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    func write(data: Data, n: Int, iz: Double, cz: Double, variance: Double,
+               ones: Int, bits: Int, totalOnes: Int, totalBits: Int) throws {
+        // Roll back this sample on a partial write so raw/CSV/counts stay aligned.
+        let rawOffset = try raw?.offset()
+        let csvOffset = try csv?.offset()
+        do {
+            try raw?.write(contentsOf: Self.rawText(data))
+            let line = "\(n),\(String(format: "%.6f", iz)),\(String(format: "%.6f", cz)),\(String(format: "%.6f", variance)),\(ones),\(bits),\(totalOnes),\(totalBits)\n"
+            try csv?.write(contentsOf: Data(line.utf8))
+        } catch {
+            var failures = [error.localizedDescription]
+            if let rawOffset {
+                do { try raw?.truncate(atOffset: rawOffset) }
+                catch { failures.append(error.localizedDescription) }
+            }
+            if let csvOffset {
+                do { try csv?.truncate(atOffset: csvOffset) }
+                catch { failures.append(error.localizedDescription) }
+            }
+            throw CollectionFailure(messages: failures, connectionLost: false)
+        }
+    }
+
+    func finish() throws {
+        var failures: [String] = []
+        // One failed sync/close must not skip closing the other output.
+        for handle in [raw, csv].compactMap({ $0 }) {
+            do { try handle.synchronize() }
+            catch { failures.append(error.localizedDescription) }
+            do { try handle.close() }
+            catch { failures.append(error.localizedDescription) }
+        }
+        raw = nil
+        csv = nil
+        if !failures.isEmpty {
+            throw CollectionFailure(messages: failures, connectionLost: false)
+        }
+    }
+
+    func close() {
+        try? raw?.close(); raw = nil
+        try? csv?.close(); csv = nil
     }
 }

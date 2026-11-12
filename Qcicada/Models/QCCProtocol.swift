@@ -6,9 +6,13 @@
 
 import Foundation
 
-final class QCCDevice: @unchecked Sendable {
+/// All commands and reads are performed serially by the acquisition worker.
+nonisolated final class QCCDevice: @unchecked Sendable {
     
-    private let serial: SerialPort
+    private let serial: any SerialTransport
+    private var pendingContinuousData = Data()
+
+    var lastTransportError: (any Error)? { serial.lastError }
     
     // Command codes
     static let CMD_GET_STATUS: UInt8    = 0x01
@@ -42,13 +46,13 @@ final class QCCDevice: @unchecked Sendable {
     
     private static let MAX_BLOCK_SIZE = 4096
     
-    init(serial: SerialPort) {
+    init(serial: any SerialTransport) {
         self.serial = serial
     }
     
     // MARK: - High-level commands
     
-    struct DeviceStatus {
+    nonisolated struct DeviceStatus: Sendable {
         let started: Bool
         let startupTestInProgress: Bool
         let voltageLow: Bool
@@ -60,14 +64,14 @@ final class QCCDevice: @unchecked Sendable {
         let readyBytes: UInt32
     }
     
-    struct DeviceInfo {
+    nonisolated struct DeviceInfo: Sendable {
         let coreVersion: UInt32
         let swVersion: UInt32
         let serial: String
         let hwInfo: String
     }
     
-    struct DeviceStatistics {
+    nonisolated struct DeviceStatistics: Sendable {
         let generatedBytes: UInt64
         let repetitionCountFailures: UInt32
         let adaptiveProportionFailures: UInt32
@@ -84,8 +88,8 @@ final class QCCDevice: @unchecked Sendable {
         guard payload.count == 5 else { return nil }
         
         let flags = payload[0]
-        let readyBytes = payload.subdata(in: 1..<5).withUnsafeBytes {
-            $0.load(as: UInt32.self)
+        let readyBytes = payload.withUnsafeBytes {
+            UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self))
         }
         
         return DeviceStatus(
@@ -107,8 +111,12 @@ final class QCCDevice: @unchecked Sendable {
         }
         guard payload.count == 56 else { return nil }
         
-        let coreVersion = payload.subdata(in: 0..<4).withUnsafeBytes { $0.load(as: UInt32.self) }
-        let swVersion = payload.subdata(in: 4..<8).withUnsafeBytes { $0.load(as: UInt32.self) }
+        let coreVersion = payload.withUnsafeBytes {
+            UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
+        }
+        let swVersion = payload.withUnsafeBytes {
+            UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self))
+        }
         
         let serialData = payload.subdata(in: 8..<32)
         let hwData = payload.subdata(in: 32..<56)
@@ -132,13 +140,13 @@ final class QCCDevice: @unchecked Sendable {
         
         return payload.withUnsafeBytes { buf in
             DeviceStatistics(
-                generatedBytes: buf.load(fromByteOffset: 0, as: UInt64.self),
-                repetitionCountFailures: buf.load(fromByteOffset: 8, as: UInt32.self),
-                adaptiveProportionFailures: buf.load(fromByteOffset: 12, as: UInt32.self),
-                bitcountFailures: buf.load(fromByteOffset: 16, as: UInt32.self),
-                speed: buf.load(fromByteOffset: 20, as: UInt32.self),
-                sensifAverage: buf.load(fromByteOffset: 24, as: UInt16.self),
-                ledctrlLevel: buf.load(fromByteOffset: 26, as: Float.self)
+                generatedBytes: UInt64(littleEndian: buf.loadUnaligned(fromByteOffset: 0, as: UInt64.self)),
+                repetitionCountFailures: UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: 8, as: UInt32.self)),
+                adaptiveProportionFailures: UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: 12, as: UInt32.self)),
+                bitcountFailures: UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: 16, as: UInt32.self)),
+                speed: UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: 20, as: UInt32.self)),
+                sensifAverage: UInt16(littleEndian: buf.loadUnaligned(fromByteOffset: 24, as: UInt16.self)),
+                ledctrlLevel: Float(bitPattern: UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: 26, as: UInt32.self)))
             )
         }
     }
@@ -152,13 +160,24 @@ final class QCCDevice: @unchecked Sendable {
     
     /// Read random bytes in continuous mode (blocking)
     func readContinuous(count: Int) -> Data? {
+        guard count > 0 else { return nil }
         let timeout = 0.1 + 0.0001 * Double(count)
-        let data = serial.read(count: count, timeout: timeout)
-        return data.count == count ? data : nil
+        if pendingContinuousData.count < count {
+            pendingContinuousData.append(serial.read(
+                count: count - pendingContinuousData.count,
+                timeout: timeout
+            ))
+        }
+        guard pendingContinuousData.count >= count else { return nil }
+
+        let data = Data(pendingContinuousData.prefix(count))
+        pendingContinuousData.removeFirst(count)
+        return data
     }
     
     /// Stop continuous mode
     func stop() -> Bool {
+        pendingContinuousData.removeAll(keepingCapacity: true)
         serial.flush()
         
         // Send stop command
@@ -195,6 +214,7 @@ final class QCCDevice: @unchecked Sendable {
     
     /// Flush serial buffers
     func flushBuffers() {
+        pendingContinuousData.removeAll(keepingCapacity: true)
         serial.flush()
         serial.flushInput()
         // Drain any remaining data
@@ -202,6 +222,7 @@ final class QCCDevice: @unchecked Sendable {
     }
     
     func closeComm() {
+        pendingContinuousData.removeAll(keepingCapacity: false)
         serial.close()
     }
     
@@ -210,6 +231,7 @@ final class QCCDevice: @unchecked Sendable {
     /// Send command and receive response payload.
     /// Returns payload Data on success, nil on failure.
     private func command(cmd: UInt8, payload: Data?) -> Data? {
+        pendingContinuousData.removeAll(keepingCapacity: true)
         serial.flush()
         
         var toSend = Data([cmd])

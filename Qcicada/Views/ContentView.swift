@@ -8,14 +8,14 @@ struct ContentView: View {
     @State private var engine = RandomTestEngine()
     @State private var settings = AppSettings()
     @State private var availablePorts: [String] = []
-    @State private var showSettings = false
-    @State private var showAuditProgress = false
-    @State private var auditStatus = ""
-    @State private var auditComplete = false
-    @State private var lastAuditPath = ""
-    @State private var isClosingFlow = false
-    @State private var pendingWindowClose: (() -> Void)?
-    
+    @State private var settingsWindow: SettingsWindowController?
+    @State private var session: SessionController?
+    @State private var isWindowClosing = false
+    private var showAuditProgress: Bool { session?.isSaving ?? false }
+    private var auditStatus: String { session?.auditStatus ?? "" }
+    private var auditComplete: Bool { session?.auditComplete ?? false }
+    private var lastAuditPath: String { session?.lastAuditPath ?? "" }
+
     var body: some View {
         ZStack {
             // Native blur background
@@ -44,7 +44,8 @@ struct ContentView: View {
                 
                 Group {
                     if engine.isRunning || showAuditProgress {
-                        waveformArea
+                        WaveformArea(engine: engine, settings: settings,
+                                     showAuditProgress: showAuditProgress, auditStatus: auditStatus)
                             .padding(16)
                     } else if engine.isConnected {
                         readyView
@@ -60,6 +61,7 @@ struct ContentView: View {
         .environment(\.locale, settings.localeForEnvironment)
         .preferredColorScheme(settings.resolvedColorScheme)
         .onAppear {
+            if session == nil { session = SessionController(engine: engine, settings: settings) }
             RandomTestEngine.uiLocale = settings.stringResolutionLocale
             availablePorts = RandomTestEngine.availablePorts()
             if let first = availablePorts.first {
@@ -70,19 +72,13 @@ struct ContentView: View {
             RandomTestEngine.uiLocale = settings.stringResolutionLocale
         }
         .onDisappear {
-            engine.stop()
-            engine.disconnect()
-            engine.releaseMemory()
-        }
-        .sheet(isPresented: $showSettings) {
-            SettingsView(settings: settings)
-                .environment(\.locale, settings.localeForEnvironment)
+            settingsWindow?.close()
+            settingsWindow = nil
+            session?.detach()
         }
         .background(
-            WindowCloseInterceptor { _ in
-                requestWindowClose {
-                    NSApplication.shared.terminate(nil)
-                }
+            WindowCloseInterceptor { closeNow in
+                requestWindowClose(closeNow: closeNow)
             }
         )
     }
@@ -167,7 +163,10 @@ struct ContentView: View {
             
             // Settings
             Button {
-                showSettings = true
+                if settingsWindow == nil {
+                    settingsWindow = SettingsWindowController(settings: settings)
+                }
+                settingsWindow?.open()
             } label: {
                 Image(systemName: "gearshape")
                     .font(.system(size: 13))
@@ -192,8 +191,7 @@ struct ContentView: View {
         } else if engine.isConnected {
             HStack(spacing: 8) {
                 Button {
-                    engine.exportDirectory = settings.exportPath
-                    engine.start()
+                    session?.start()
                 } label: {
                     Label(LocalizedStringResource("main.start"), systemImage: "play.fill")
                 }
@@ -202,7 +200,7 @@ struct ContentView: View {
                 .controlSize(.regular)
                 
                 Button {
-                    engine.disconnect()
+                    session?.disconnect()
                 } label: {
                     Label(LocalizedStringResource("main.disconnect"), systemImage: "xmark.circle")
                 }
@@ -211,7 +209,7 @@ struct ContentView: View {
             }
         } else {
             Button {
-                engine.connect()
+                session?.connect()
             } label: {
                 Label(LocalizedStringResource("main.connect"), systemImage: "cable.connector")
             }
@@ -223,119 +221,23 @@ struct ContentView: View {
     
     // MARK: - Stop + Audit + Export
     
-    private func stopAndAudit(completion: (() -> Void)? = nil) {
-        let izSnapshot = Array(engine.izFull)
-        let czSnapshot = Array(engine.czFull)
-        let varSnapshot = Array(engine.varFull)
-        let rawFilePath = engine.currentRawFilePath
-        let totalOnes = engine.totalOnes
-        let totalBits = engine.totalBits
-        let sampleCount = engine.sampleCount
-        let izMean = engine.izMean
-        let izVariance = engine.izVariance
-        let peakInstHi = engine.peakInstHi
-        let peakInstLo = engine.peakInstLo
-        let peakCumHi = engine.peakCumHi
-        let peakCumLo = engine.peakCumLo
-        let exportPath = settings.exportPath
-        let port = engine.portPath
-        let direction = engine.direction
-        let chunkSize = engine.chunkSize
-        let doPlot = settings.autoSavePlot
-        let doAudit = settings.autoSaveAudit
-        let loc = settings.stringResolutionLocale
-        
-        engine.stop()
-        
-        guard doPlot || doAudit else {
-            auditComplete = true
-            completion?()
-            return
-        }
-        
-        showAuditProgress = true
-        auditComplete = false
-        auditStatus = String(localized: "audit.saving", locale: loc ?? .current)
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            if doPlot && !izSnapshot.isEmpty {
-                DispatchQueue.main.async { auditStatus = String(localized: "audit.status.plot", locale: loc ?? .current) }
-                PlotExporter.saveFullPlot(
-                    iz: izSnapshot, cz: czSnapshot, vr: varSnapshot,
-                    stats: (sampleCount, totalBits, totalOnes, peakInstHi, peakInstLo, peakCumHi, peakCumLo, izMean, izVariance),
-                    to: exportPath
-                )
-            }
-            
-            if doAudit {
-                DispatchQueue.main.async { auditStatus = String(localized: "audit.status.run", locale: loc ?? .current) }
-                let report = AuditEngine.runAudit(
-                    rawFilePath: rawFilePath,
-                    izValues: izSnapshot,
-                    totalOnes: totalOnes,
-                    totalBits: totalBits,
-                    sampleCount: sampleCount,
-                    izMean: izMean,
-                    izVariance: izVariance,
-                    peakInstHi: peakInstHi,
-                    peakInstLo: peakInstLo,
-                    peakCumHi: peakCumHi,
-                    peakCumLo: peakCumLo,
-                    locale: loc
-                ) { status in
-                    DispatchQueue.main.async { auditStatus = status }
-                }
-                
-                let auditPath = AuditEngine.saveReport(
-                    report, to: exportPath, port: port,
-                    direction: direction, chunkSize: chunkSize
-                )
-                
-                DispatchQueue.main.async { lastAuditPath = auditPath }
-            }
-            
-            DispatchQueue.main.async {
-                auditComplete = true
-                showAuditProgress = false
-                completion?()
-                
-                // If the user clicked the red close button during audit, close now.
-                if let pendingClose = pendingWindowClose {
-                    pendingWindowClose = nil
-                    performCleanupAndClose(pendingClose)
-                }
-            }
-        }
+    private func stopAndAudit() {
+        session?.stopAndSave()
     }
-    
+
     private func requestWindowClose(closeNow: @escaping () -> Void) {
-        if isClosingFlow { return }
-        
-        if showAuditProgress {
-            // Audit is already saving in background; close after it completes.
-            isClosingFlow = true
-            pendingWindowClose = closeNow
-            return
-        }
-        
-        isClosingFlow = true
-        if engine.isRunning {
-            stopAndAudit {
-                performCleanupAndClose(closeNow)
+        guard !isWindowClosing else { return }
+        guard let session else { closeNow(); return }
+        isWindowClosing = true
+        session.prepareForShutdown { saved in
+            if saved { closeNow() }
+            else {
+                isWindowClosing = false
+                session.resumeAfterCancelledShutdown()
             }
-        } else {
-            performCleanupAndClose(closeNow)
         }
     }
-    
-    private func performCleanupAndClose(_ closeNow: @escaping () -> Void) {
-        engine.stop()
-        engine.disconnect()
-        engine.releaseMemory()
-        isClosingFlow = false
-        closeNow()
-    }
-    
+
     // MARK: - Connect View
     
     private var connectView: some View {
@@ -375,11 +277,22 @@ struct ContentView: View {
                 .foregroundStyle(.green)
             Text(LocalizedStringResource("ready.connected"))
                 .font(.title3.weight(.medium))
+            if let error = engine.connectionError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(
+                        .red.opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+            }
             Text(
                 String(
                     format: String(localized: "ready.detail", locale: settings.stringResolutionLocale ?? .current),
                     locale: settings.localeForEnvironment,
-                    arguments: [engine.deviceSerial as NSString, NSNumber(value: engine.readyBytes)]
+                    arguments: [engine.deviceSerial as NSString, engine.readyBytes]
                 )
             )
                 .font(.system(size: 13))
@@ -404,184 +317,5 @@ struct ContentView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-    
-    // MARK: - Waveform Area
-    
-    private var waveformArea: some View {
-        VStack(spacing: 10) {
-            statsBar
-            
-            if showAuditProgress {
-                VStack(spacing: 10) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(auditStatus)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                // Instant Z
-                VStack(alignment: .leading, spacing: 4) {
-                    chartHeader(
-                        title: tx("chart.header.instant_z"),
-                        value: engine.instantZ,
-                        hi: engine.peakInstHi,
-                        lo: engine.peakInstLo,
-                        color: settings.instantZColor
-                    )
-                    WaveformChart(
-                        title: tx("chart.instant_z"),
-                        data: engine.izHistory,
-                        color: settings.instantZColor,
-                        lineWidth: settings.chartLineWidth,
-                        thresholds: [1.96, 2.58],
-                        thresholdColor: settings.thresholdColor,
-                        referenceValue: 0,
-                        historySize: engine.historySize,
-                        chartBackground: settings.chartBackground
-                    )
-                    .frame(maxHeight: .infinity)
-                }
-                
-                // Inset divider (Apple style: not edge-to-edge)
-                if settings.showDividers {
-                    Divider()
-                        .opacity(settings.dividerOpacity)
-                        .padding(.horizontal, 4)
-                }
-                
-                // Cumulative Z
-                VStack(alignment: .leading, spacing: 4) {
-                    chartHeader(
-                        title: tx("chart.header.cumulative_z"),
-                        value: engine.cumulativeZ,
-                        hi: engine.peakCumHi,
-                        lo: engine.peakCumLo,
-                        color: settings.cumulativeZColor
-                    )
-                    WaveformChart(
-                        title: tx("chart.cumulative_z"),
-                        data: engine.czHistory,
-                        color: settings.cumulativeZColor,
-                        lineWidth: settings.chartLineWidth,
-                        thresholds: [1.96],
-                        thresholdColor: settings.thresholdColor,
-                        referenceValue: 0,
-                        historySize: engine.historySize,
-                        chartBackground: settings.chartBackground
-                    )
-                    .frame(maxHeight: .infinity)
-                }
-                
-                if settings.showDividers {
-                    Divider()
-                        .opacity(settings.dividerOpacity)
-                        .padding(.horizontal, 4)
-                }
-                
-                // Variance
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text(LocalizedStringResource("chart.variance_axis"))
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(settings.varianceColor)
-                        StatPill(label: tx("pill.var"), value: String(format: "%.4f", engine.izVariance), color: settings.varianceColor)
-                        StatPill(
-                            label: tx("pill.z_var"),
-                            value: String(format: "%+.2f", engine.varianceZScore),
-                            color: abs(engine.varianceZScore) > 1.96 ? .red : .secondary
-                        )
-                    }
-                    WaveformChart(
-                        title: tx("chart.variance"),
-                        data: engine.varHistory,
-                        color: settings.varianceColor,
-                        lineWidth: settings.chartLineWidth,
-                        referenceValue: 1.0,
-                        historySize: engine.historySize,
-                        chartBackground: settings.chartBackground
-                    )
-                    .frame(height: 80)
-                }
-            }
-        }
-    }
-    
-    // MARK: - Stats Bar
-    
-    private var statsBar: some View {
-        HStack(spacing: 6) {
-            StatPill(label: tx("pill.sample_index"), value: "\(engine.sampleCount)", color: .primary)
-            StatPill(label: tx("pill.bits"), value: formatNumber(engine.totalBits), color: .primary)
-            StatPill(
-                label: tx("pill.ones_pct"),
-                value: engine.totalBits > 0
-                    ? String(format: "%.4f%%", Double(engine.totalOnes) / Double(engine.totalBits) * 100)
-                    : tx("placeholder.em_dash"),
-                color: .primary
-            )
-            StatPill(label: tx("pill.mean"), value: String(format: "%+.3f", engine.izMean), color: .secondary)
-            Spacer()
-            significanceLabel
-        }
-    }
-    
-    @ViewBuilder
-    private var significanceLabel: some View {
-        let z = engine.cumulativeZ
-        let label = localizedSignificance(z)
-        if !label.isEmpty {
-            Text(label)
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(significanceColor(z))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(significanceColor(z).opacity(0.12), in: Capsule())
-        }
-    }
-    
-    private func chartHeader(title: String, value: Double, hi: Double, lo: Double, color: Color) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(color)
-            StatPill(label: tx("pill.z"), value: String(format: "%+.2f", value), color: color)
-            StatPill(label: tx("pill.high"), value: String(format: "%+.2f", hi > -900 ? hi : 0), color: .green)
-            StatPill(label: tx("pill.low"), value: String(format: "%+.2f", lo < 900 ? lo : 0), color: .red)
-        }
-    }
-    
-    private func significanceColor(_ z: Double) -> Color {
-        let az = abs(z)
-        if az >= 3.29 { return .red }
-        if az >= 2.58 { return .orange }
-        if az >= 1.96 { return .yellow }
-        if az >= 1.645 { return .mint }
-        return .secondary
-    }
-    
-    private func formatNumber(_ n: Int) -> String {
-        if n >= 1_000_000_000 { return String(format: "%.1fB", Double(n) / 1e9) }
-        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1e6) }
-        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1e3) }
-        return "\(n)"
-    }
-    
-    private func tx(_ key: String) -> String {
-        String(localized: String.LocalizationValue(key), locale: settings.stringResolutionLocale ?? .current)
-    }
-    
-    private func localizedSignificance(_ z: Double) -> String {
-        let code = RandomTestEngine.interpret(z)
-        switch code {
-        case "EXTREME": return tx("sig.extreme")
-        case "VERY SIG": return tx("sig.very_significant")
-        case "SIGNIF": return tx("sig.significant")
-        case "MARGINAL": return tx("sig.marginal")
-        case "trend": return tx("sig.trend")
-        default: return code
-        }
     }
 }
